@@ -1,12 +1,8 @@
 from __future__ import absolute_import, division, print_function, unicode_literals
 import tensorflow as tf
 import numpy as np
-
 import matplotlib as mpl
-
-import IPython.display as display
 import PIL.Image
-
 from tensorflow.keras.preprocessing import image
 
 # Normalize an image
