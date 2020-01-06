@@ -39,76 +39,100 @@ def calc_loss(img, model):
 
   return  tf.reduce_sum(losses)
 
-class DeepDream(tf.Module):
+def random_roll(img, maxroll):
+  # Randomly shift the image to avoid tiled boundaries.
+  shift = tf.random.uniform(shape=[2], minval=-maxroll, maxval=maxroll, dtype=tf.int32)
+  shift_down, shift_right = shift[0],shift[1] 
+  img_rolled = tf.roll(tf.roll(img, shift_right, axis=1), shift_down, axis=0)
+  return shift_down, shift_right, img_rolled
+
+class TiledGradients(tf.Module):
   def __init__(self, model):
     self.model = model
 
   @tf.function(
-    input_signature=(
-      tf.TensorSpec(shape=[None,None,3], dtype=tf.float32),
-      tf.TensorSpec(shape=[], dtype=tf.int32),
-      tf.TensorSpec(shape=[], dtype=tf.float32),)
+      input_signature=(
+        tf.TensorSpec(shape=[None,None,3], dtype=tf.float32),
+        tf.TensorSpec(shape=[], dtype=tf.int32),)
   )
-  def __call__(self, img, steps, step_size):
-    print("Tracing")
-    loss = tf.constant(0.0)
-    for n in tf.range(steps):
-      print("step")
-      with tf.GradientTape() as tape:
-        # This needs gradients relative to `img`
-        # `GradientTape` only watches `tf.Variable`s by default
-        tape.watch(img)
-        loss = calc_loss(img, self.model)
+  def __call__(self, img, tile_size=512):
+    shift_down, shift_right, img_rolled = random_roll(img, tile_size)
 
-      # Calculate the gradient of the loss with respect to the pixels of the input image.
-      gradients = tape.gradient(loss, img)
+    # Initialize the image gradients to zero.
+    gradients = tf.zeros_like(img_rolled)
+    
+    # Skip the last tile, unless there's only one tile.
+    xs = tf.range(0, img_rolled.shape[0], tile_size)[:-1]
+    if not tf.cast(len(xs), bool):
+      xs = tf.constant([0])
+    ys = tf.range(0, img_rolled.shape[1], tile_size)[:-1]
+    if not tf.cast(len(ys), bool):
+      ys = tf.constant([0])
 
-      # Normalize the gradients.
-      gradients /= tf.math.reduce_std(gradients) + 1e-8 
-                                                                                                                                        
-      # In gradient ascent, the "loss" is maximized so that the input image increasingly "excites" the layers.
-      # You can update the image by directly adding the gradients (because they're the same shape!)
+    for x in xs:
+      for y in ys:
+        # Calculate the gradients for this tile.
+        with tf.GradientTape() as tape:
+          # This needs gradients relative to `img_rolled`.
+          # `GradientTape` only watches `tf.Variable`s by default.
+          tape.watch(img_rolled)
+
+          # Extract a tile out of the image.
+          img_tile = img_rolled[x:x+tile_size, y:y+tile_size]
+          loss = calc_loss(img_tile, self.model)
+
+        # Update the image gradients for this tile.
+        gradients = gradients + tape.gradient(loss, img_rolled)
+
+    # Undo the random shift applied to the image and its gradients.
+    gradients = tf.roll(tf.roll(gradients, -shift_right, axis=1), -shift_down, axis=0)
+
+    # Normalize the gradients.
+    gradients /= tf.math.reduce_std(gradients) + 1e-8 
+
+    return gradients 
+
+get_tiled_gradients = TiledGradients(dream_model)
+
+#Decreasing octave_scale to a lower value will improve the processing time, but it will also decrease the quality of the effect.
+
+#Changing "keep_img_size" to False will make the image's output resolution with each octave.
+#If you are planning on turning the image sequence into a video of some kind, I recommend keeping this setting as "True".
+#Otherwise, setting this as False would be a good idea.
+
+#The variable "display_frequency" changes how many of the steps are actually added to the image sequence.
+#For example, setting it to 1 will add a new image to the sequnce on every step, while setting it to 4
+#will only add a new image to the sequence on every fourth step.
+
+def run_deep_dream_with_octaves(img, steps_per_octave=100, step_size=0.01, 
+                                octaves=range(-2,3), octave_scale=1.3, display_frequency=5, keep_img_size=True):
+  #display the number of images that will be created
+  print("Creating " + str(int((len(octaves)*steps_per_octave)/display_frequency)) + " images.")
+
+  base_shape = tf.shape(img)
+  img = tf.keras.preprocessing.image.img_to_array(img)
+  img = tf.keras.applications.inception_v3.preprocess_input(img)
+
+  initial_shape = img.shape[:-1]
+  img = tf.image.resize(img, initial_shape)
+  print("Starting first octave.")
+  for octave in octaves:
+    # Scale the image based on the octave
+    new_size = tf.cast(tf.convert_to_tensor(base_shape[:-1]), tf.float32)*(octave_scale**octave)
+    img = tf.image.resize(img, tf.cast(new_size, tf.int32))
+
+    for step in range(steps_per_octave):
+      gradients = get_tiled_gradients(img)
       img = img + gradients*step_size
       img = tf.clip_by_value(img, -1, 1)
-    return loss, img
-deepdream = DeepDream(dream_model)
 
-def run_deep_dream_simple(img, steps=100, step_size=0.01):
-  # Convert from uint8 to the range expected by the model.
-  img = tf.keras.applications.inception_v3.preprocess_input(img)
-  img = tf.convert_to_tensor(img)
-  step_size = tf.convert_to_tensor(step_size)
-  steps_remaining = steps
-  step = 0
-  while steps_remaining:
-    if steps_remaining>100:
-      run_steps = tf.constant(100)
-    else:
-      run_steps = tf.constant(steps_remaining)
-    steps_remaining -= run_steps
-    step += run_steps
-    loss, img = deepdream(img, run_steps, tf.constant(step_size))
-    show(deprocess(img))
-    print ("Step {}, loss {}".format(step, loss))
-  return deprocess(img)
+      if step % display_frequency == 0:
+        if keep_img_size == True:
+          show(deprocess(tf.image.resize(img, initial_shape)))
+        else:
+          show(deprocess(img))
+    print ("Completed {} out of {} octaves.".format(octaves.index(octave) + 1, len(octaves)) )
+  result = deprocess(img)
+  return result
 
-import time
-start = time.time()
-
-img = tf.constant(np.array(original_img))
-base_shape = tf.shape(img)[:-1]
-float_base_shape = tf.cast(base_shape, tf.float32)
-img=img.numpy()
-repin=1
-while repin < 100:
-  img = np.clip(run_deep_dream_simple(img=img, steps=1, step_size=0.01), 0.0, 255.0)
-  if repin % 2 == 0:
-    img[:, :, 0] += 1
-    img[:, :, 1] += 1
-    img[:, :, 2] += 1
-    img = np.clip(img, 0.0, 255.0)
-  img = img.astype(np.uint8)
-  repin += 1
-
-end = time.time()
-end-start
+run_deep_dream_with_octaves(img=original_img, step_size=0.01)
